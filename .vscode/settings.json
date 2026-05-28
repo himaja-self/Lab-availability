@@ -1,0 +1,6 @@
+{
+  "python.analysis.extraPaths": [
+    "./parser/excel",
+    "./parser/word"
+  ]
+}
