@@ -6,9 +6,6 @@ Routes:
   POST /api/semesters          - Create a semester
   GET  /api/semesters          - List all semesters
   DELETE /api/semesters/<id>   - Delete a semester and all its data
-  POST /api/holidays           - Add a holiday
-  GET  /api/holidays           - List holidays for a semester
-  DELETE /api/holidays/<id>    - Delete a holiday
   POST /api/academic-calendar  - Add an academic calendar event
   GET  /api/academic-calendar  - List events for a semester
   DELETE /api/academic-calendar/<id> - Delete an event
@@ -33,16 +30,15 @@ from db import (
     create_semester,
     list_semesters,
     delete_semester,
-    add_holiday,
-    list_holidays,
-    delete_holiday,
     add_academic_event,
     list_academic_events,
+    upsert_academic_calendar_events,
     delete_academic_event,
     get_availability,
     list_labs,
     list_notifications,
     mark_notification_read,
+    mark_all_notifications_read,
     log_upload,
     create_notification,
 )
@@ -98,50 +94,15 @@ def del_semester(semester_id):
         return jsonify({'error': str(e)}), 500
 
 
-# ── Holidays ──────────────────────────────────────────────────
-
-@app.route('/api/holidays', methods=['GET'])
-def get_holidays():
-    semester_id = request.args.get('semester_id')
-    try:
-        holidays = list_holidays(semester_id)
-        return jsonify(holidays)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/holidays', methods=['POST'])
-def post_holiday():
-    data = request.json
-    if not data.get('date') or not data.get('name') or not data.get('semester_id'):
-        return jsonify({'error': 'Missing fields: date, name, semester_id required'}), 400
-    try:
-        holiday = add_holiday(
-            date=data['date'],
-            name=data['name'],
-            semester_id=data['semester_id'],
-        )
-        return jsonify(holiday), 201
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/holidays/<holiday_id>', methods=['DELETE'])
-def del_holiday(holiday_id):
-    try:
-        delete_holiday(holiday_id)
-        return jsonify({'message': 'Holiday deleted.'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 # ── Academic Calendar ─────────────────────────────────────────
 
 @app.route('/api/academic-calendar', methods=['GET'])
 def get_academic_events():
     semester_id = request.args.get('semester_id')
+    year_of_study = request.args.get('year_of_study')
     try:
-        events = list_academic_events(semester_id)
+        year = int(year_of_study) if year_of_study else None
+        events = list_academic_events(semester_id, year_of_study=year)
         return jsonify(events)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -149,7 +110,24 @@ def get_academic_events():
 
 @app.route('/api/academic-calendar', methods=['POST'])
 def post_academic_event():
-    data = request.json
+    data = request.json or {}
+
+    # Bulk upsert: { semester_id, year_of_study, events: [...] }
+    if 'events' in data:
+        semester_id = data.get('semester_id')
+        year_of_study = data.get('year_of_study')
+        events = data.get('events')
+        if not semester_id or year_of_study is None or not isinstance(events, list):
+            return jsonify({'error': 'semester_id, year_of_study, and events[] are required'}), 400
+        try:
+            saved = upsert_academic_calendar_events(semester_id, int(year_of_study), events)
+            return jsonify({'saved': saved, 'count': len(saved)}), 200
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # Single event (legacy)
     required = ['semester_id', 'event_name', 'start_date', 'end_date']
     for field in required:
         if not data.get(field):
@@ -160,7 +138,7 @@ def post_academic_event():
             event_name=data['event_name'],
             start_date=data['start_date'],
             end_date=data['end_date'],
-            year_of_study=data.get('year_of_study'),   # None = all years
+            year_of_study=data.get('year_of_study'),
             makes_labs_free=data.get('makes_labs_free', False),
         )
         return jsonify(event), 201
@@ -256,12 +234,20 @@ def handle_upload(parse_fn, file_ext):
                 notif_type='upload_error',
             )
 
+        hint = None
+        if any('lab_sessions_year_group_check' in e for e in errors):
+            hint = (
+                'Supabase year_group constraint is outdated. Run '
+                'supabase/lab_sessions_year_group.sql in the SQL Editor, then re-upload.'
+            )
+
         return jsonify({
             'status': parse_status,
             'sessions_inserted': inserted,
             'labs_found': labs_found,
             'warnings': warnings,
             'errors': errors,
+            'hint': hint,
         })
 
     except Exception as e:
@@ -283,7 +269,12 @@ def handle_upload(parse_fn, file_ext):
         )
         return jsonify({'error': str(e)}), 500
     finally:
-        os.unlink(tmp_path)
+        # On Windows, libraries like openpyxl can keep file handles open briefly.
+        # Best-effort cleanup; don't fail the API response due to temp delete issues.
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 
 @app.route('/api/parse/excel', methods=['POST'])
@@ -305,12 +296,14 @@ def check_availability():
       date        - YYYY-MM-DD (required)
       start_time  - HH:MM in 24h (required)
       end_time    - HH:MM in 24h (required)
-      semester_id - UUID (optional, uses active semester if omitted)
+      semester_id    - UUID (optional, uses active semester if omitted)
+      block          - A|B|C|D|E|P (optional, filters labs by room prefix)
     """
     date = request.args.get('date')
     start_time = request.args.get('start_time')
     end_time = request.args.get('end_time')
     semester_id = request.args.get('semester_id')
+    block = request.args.get('block')
 
     if not date or not start_time or not end_time:
         return jsonify({'error': 'date, start_time, end_time are required'}), 400
@@ -327,7 +320,7 @@ def check_availability():
         return jsonify({'error': 'start_time must be before end_time'}), 400
 
     try:
-        result = get_availability(date, start_time, end_time, semester_id)
+        result = get_availability(date, start_time, end_time, semester_id, block=block)
         return jsonify(result)
     except Exception as e:
         traceback.print_exc()
@@ -352,6 +345,15 @@ def get_notifications():
     try:
         notifications = list_notifications()
         return jsonify(notifications)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/notifications/read-all', methods=['PATCH'])
+def read_all_notifications():
+    try:
+        mark_all_notifications_read()
+        return jsonify({'message': 'All notifications marked as read.'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

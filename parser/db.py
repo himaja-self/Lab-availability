@@ -10,7 +10,8 @@ from datetime import date, datetime
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+# Ensure we load the repo's active env file (`parser/.env`) regardless of cwd.
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
 SUPABASE_URL = os.environ.get('SUPABASE_URL', 'https://zyzsourijufzusqmxozj.supabase.co')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')  # service role key
@@ -51,8 +52,7 @@ def list_semesters():
 
     # If setting active, deactivate all others first
 def create_semester(name, start_date, end_date, is_active=False):
-    print(f"DEBUG URL: {_url('semesters')}")
-    print(f"DEBUG KEY: {SUPABASE_KEY[:20] if SUPABASE_KEY else 'NONE'}")
+    # Avoid logging secrets (SUPABASE_KEY) or internal URLs in normal operation.
     if is_active:
         requests.patch(
             _url('semesters'),
@@ -112,6 +112,18 @@ def list_labs():
         params={'order': 'room_number.asc'},
     )
     _raise_for_status(resp, 'list_labs')
+    return resp.json()
+
+
+def list_labs_filtered(block=None):
+    params = {
+        'order': 'room_number.asc',
+        'select': 'id,room_number,has_data',
+    }
+    if block:
+        params['room_number'] = f'like.{block.upper()}-%'
+    resp = requests.get(_url('labs'), headers=_headers(), params=params)
+    _raise_for_status(resp, 'list_labs_filtered')
     return resp.json()
 
 
@@ -198,7 +210,7 @@ def upsert_sessions(sessions, lab_id_map, semester_id, source_file):
                 'class_name': s.get('class_name', ''),
                 'subject': s.get('subject', ''),
                 'session_type': s.get('session_type', 'OTHER'),
-                'year_group': s.get('year_group', 'II_III_YEAR'),
+                'year_group': s.get('year_group', 'II_YEAR'),
                 'source_file': source_file,
             })
 
@@ -218,65 +230,21 @@ def upsert_sessions(sessions, lab_id_map, semester_id, source_file):
     return inserted, errors
 
 
-# ── Holidays ──────────────────────────────────────────────────
-
-def list_holidays(semester_id=None):
-    params = {'order': 'date.asc'}
-    if semester_id:
-        params['semester_id'] = f'eq.{semester_id}'
-    resp = requests.get(_url('holidays'), headers=_headers(), params=params)
-    _raise_for_status(resp, 'list_holidays')
-    return resp.json()
-
-
-def add_holiday(date, name, semester_id):
-    resp = requests.post(
-        _url('holidays'),
-        headers=_headers(),
-        json={'date': date, 'name': name, 'semester_id': semester_id},
-    )
-    _raise_for_status(resp, 'add_holiday')
-    data = resp.json()
-    return data[0] if isinstance(data, list) else data
-
-
-def delete_holiday(holiday_id):
-    resp = requests.delete(
-        _url('holidays'),
-        headers=_headers(),
-        params={'id': f'eq.{holiday_id}'},
-    )
-    _raise_for_status(resp, 'delete_holiday')
-
-
-def is_holiday(query_date, semester_id):
-    """Return holiday name if date is a holiday, else None."""
-    resp = requests.get(
-        _url('holidays'),
-        headers=_headers(),
-        params={
-            'date': f'eq.{query_date}',
-            'semester_id': f'eq.{semester_id}',
-            'limit': 1,
-        },
-    )
-    _raise_for_status(resp, 'is_holiday')
-    data = resp.json()
-    return data[0]['name'] if data else None
-
-
 # ── Academic Calendar ─────────────────────────────────────────
 
-def list_academic_events(semester_id=None):
+def list_academic_events(semester_id=None, year_of_study=None):
     params = {'order': 'start_date.asc'}
     if semester_id:
         params['semester_id'] = f'eq.{semester_id}'
+    if year_of_study is not None:
+        params['year_of_study'] = f'eq.{year_of_study}'
     resp = requests.get(_url('academic_calendars'), headers=_headers(), params=params)
     _raise_for_status(resp, 'list_academic_events')
     return resp.json()
 
 
-def add_academic_event(semester_id, event_name, start_date, end_date, year_of_study=None, makes_labs_free=False):
+def add_academic_event(semester_id, event_name, start_date, end_date, year_of_study=None,
+                       makes_labs_free=False):
     payload = {
         'semester_id': semester_id,
         'event_name': event_name,
@@ -292,6 +260,83 @@ def add_academic_event(semester_id, event_name, start_date, end_date, year_of_st
     return data[0] if isinstance(data, list) else data
 
 
+def upsert_academic_calendar_event(semester_id, year_of_study, event_name, start_date, end_date,
+                                   makes_labs_free=False):
+    """Upsert one row keyed by (semester_id, year_of_study, event_name)."""
+    resp = requests.get(
+        _url('academic_calendars'),
+        headers=_headers(),
+        params={
+            'semester_id': f'eq.{semester_id}',
+            'year_of_study': f'eq.{year_of_study}',
+            'event_name': f'eq.{event_name}',
+            'limit': 1,
+        },
+    )
+    _raise_for_status(resp, 'upsert_academic_calendar_event_lookup')
+    existing = resp.json()
+
+    payload = {
+        'semester_id': semester_id,
+        'year_of_study': year_of_study,
+        'event_name': event_name,
+        'start_date': start_date,
+        'end_date': end_date,
+        'makes_labs_free': makes_labs_free,
+    }
+
+    if existing:
+        row_id = existing[0]['id']
+        patch = requests.patch(
+            _url('academic_calendars'),
+            headers=_headers(),
+            params={'id': f'eq.{row_id}'},
+            json=payload,
+        )
+        _raise_for_status(patch, 'upsert_academic_calendar_event_patch')
+        data = patch.json()
+        return data[0] if isinstance(data, list) else data
+
+    post = requests.post(_url('academic_calendars'), headers=_headers(), json=payload)
+    _raise_for_status(post, 'upsert_academic_calendar_event_post')
+    data = post.json()
+    return data[0] if isinstance(data, list) else data
+
+
+def upsert_academic_calendar_events(semester_id, year_of_study, events):
+    """Bulk upsert calendar events for one semester + year group."""
+    saved = []
+    for ev in events:
+        event_name = ev.get('event_name')
+        start_date = ev.get('start_date')
+        end_date = ev.get('end_date')
+        if not event_name or not start_date:
+            continue
+
+        makes_labs_free = ev.get('makes_labs_free', False)
+
+        # COMMENCEMENT: single date; end_date mirrors start if omitted
+        if event_name == 'COMMENCEMENT':
+            end_date = end_date or start_date
+            makes_labs_free = False
+        elif not end_date:
+            # Optional SE-I / SE-II may be omitted when empty
+            if event_name in ('SE_I', 'SE_II'):
+                continue
+            raise ValueError(f'end_date required for event {event_name}')
+
+        row = upsert_academic_calendar_event(
+            semester_id=semester_id,
+            year_of_study=year_of_study,
+            event_name=event_name,
+            start_date=start_date,
+            end_date=end_date,
+            makes_labs_free=makes_labs_free,
+        )
+        saved.append(row)
+    return saved
+
+
 def delete_academic_event(event_id):
     resp = requests.delete(
         _url('academic_calendars'),
@@ -301,101 +346,215 @@ def delete_academic_event(event_id):
     _raise_for_status(resp, 'delete_academic_event')
 
 
-def get_calendar_events_for_date(query_date, semester_id):
-    """Return all academic calendar events that cover the given date."""
+def get_calendar_events_for_semester(semester_id):
     resp = requests.get(
         _url('academic_calendars'),
         headers=_headers(),
         params={
             'semester_id': f'eq.{semester_id}',
-            'start_date': f'lte.{query_date}',
-            'end_date': f'gte.{query_date}',
+            'order': 'year_of_study.asc,start_date.asc',
         },
     )
-    _raise_for_status(resp, 'get_calendar_events_for_date')
+    _raise_for_status(resp, 'get_calendar_events_for_semester')
     return resp.json()
+
+
+def _is_holiday(query_date, semester_id):
+    """Return holiday name if date is a holiday, else None. Best-effort if table missing."""
+    try:
+        resp = requests.get(
+            _url('holidays'),
+            headers=_headers(),
+            params={
+                'date': f'eq.{query_date}',
+                'semester_id': f'eq.{semester_id}',
+                'limit': 1,
+            },
+        )
+        if not resp.ok:
+            return None
+        data = resp.json()
+        return data[0].get('name') if data else None
+    except Exception:
+        return None
+
+
+def _freed_years_for_date(query_date, semester_id):
+    """
+    Return set of year_of_study values (1–4) whose sessions are free on query_date
+    per academic calendar rules:
+      - before COMMENCEMENT start_date for that year
+      - within SE_I / SE_II / SEE_THEORY ranges where makes_labs_free=true
+    """
+    parsed = datetime.strptime(query_date, '%Y-%m-%d').date()
+    events = get_calendar_events_for_semester(semester_id)
+    freed = set()
+
+    for year in (1, 2, 3, 4):
+        year_events = [e for e in events if e.get('year_of_study') == year]
+
+        for ev in year_events:
+            if ev.get('event_name') == 'COMMENCEMENT' and ev.get('start_date'):
+                comm = datetime.strptime(ev['start_date'], '%Y-%m-%d').date()
+                if parsed < comm:
+                    freed.add(year)
+                    break
+
+        if year in freed:
+            continue
+
+        for ev in year_events:
+            if not ev.get('makes_labs_free'):
+                continue
+            if ev.get('event_name') not in ('SE_I', 'SE_II', 'SEE_THEORY'):
+                continue
+            if not ev.get('start_date') or not ev.get('end_date'):
+                continue
+            start = datetime.strptime(ev['start_date'], '%Y-%m-%d').date()
+            end = datetime.strptime(ev['end_date'], '%Y-%m-%d').date()
+            if start <= parsed <= end:
+                freed.add(year)
+                break
+
+    return freed
+
+
+def _calendar_banner_info(query_date, semester_id):
+    """
+    Build exam_period banner text when academic calendar affects the date.
+    Returns (day_status, message) or (None, None).
+    """
+    parsed = datetime.strptime(query_date, '%Y-%m-%d').date()
+    events = get_calendar_events_for_semester(semester_id)
+    notes = []
+
+    for year in (1, 2, 3, 4):
+        year_events = [e for e in events if e.get('year_of_study') == year]
+        for ev in year_events:
+            if not ev.get('start_date'):
+                continue
+            name = ev.get('event_name')
+            start = datetime.strptime(ev['start_date'], '%Y-%m-%d').date()
+            end_str = ev.get('end_date') or ev['start_date']
+            end = datetime.strptime(end_str, '%Y-%m-%d').date()
+
+            if name == 'COMMENCEMENT' and parsed < start:
+                notes.append(f'Year {year}: before commencement of classes')
+                break
+            if ev.get('makes_labs_free') and name in ('SE_I', 'SE_II', 'SEE_THEORY'):
+                if start <= parsed <= end:
+                    label = name.replace('_', '-')
+                    notes.append(f'Year {year}: {label} exam period')
+                    break
+
+    if not notes:
+        return None, None
+
+    message = (
+        'Academic calendar applies today — '
+        + '; '.join(notes)
+        + '. Sessions for those year groups are not counted as occupying labs.'
+    )
+    return 'exam_period', message
 
 
 # ── Availability ──────────────────────────────────────────────
 
-def get_availability(query_date, start_time, end_time, semester_id=None):
+def _years_for_year_group(year_group):
+    mapping = {
+        'I_YEAR':   {1},
+        'II_YEAR':  {2},
+        'III_YEAR': {3},
+        'IV_YEAR':  {4},
+        'II_III_YEAR': {2, 3, 4},  # keep for backwards compat if old data exists
+    }
+    return mapping.get(year_group, {2, 3, 4})
+
+
+def _lab_department_label(room_number):
+    dash = room_number.find('-')
+    if dash > 0:
+        return f'{room_number[:dash]} Block'
+    return room_number
+
+
+def get_availability(query_date, start_time, end_time, semester_id=None, block=None):
     """
     Main availability logic.
-    Returns dict with:
-      - available_labs: list of free labs
-      - occupied_labs: list of occupied labs with session details
-      - no_data_labs: list of labs with no timetable
-      - status: 'ok' | 'holiday' | 'sunday' | 'no_semester' | 'labs_free'
-      - message: human-readable explanation
+    Returns dict with available_labs, occupied_labs, no_data_labs, day_status, message.
     """
-    # 1. Check if Sunday
     parsed_date = datetime.strptime(query_date, '%Y-%m-%d').date()
-    if parsed_date.weekday() == 6:  # Sunday
-        all_labs = list_labs()
+    day_names = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
+    day_of_week = day_names[parsed_date.weekday()]
+
+    def _all_free_response(day_status, message, status=None, calendar_note=None):
+        all_labs = list_labs_filtered(block=block)
         return {
-            'status': 'sunday',
-            'message': 'It is a Sunday. All labs are free.',
-            'available_labs': [{'room_number': l['room_number'], 'id': l['id']} for l in all_labs],
+            'status': status or day_status,
+            'day_status': day_status,
+            'message': message,
+            'date': query_date,
+            'day': day_of_week,
+            'start_time': start_time,
+            'end_time': end_time,
+            'available_labs': [
+                {
+                    'room_number': l['room_number'],
+                    'department': _lab_department_label(l['room_number']),
+                    'status': 'available',
+                }
+                for l in all_labs
+            ],
             'occupied_labs': [],
             'no_data_labs': [],
+            'calendar_note': calendar_note,
         }
 
-    # 2. Find active semester
+    # Step 1 — Sunday
+    if parsed_date.weekday() == 6:
+        return _all_free_response('sunday', 'No classes on Sundays', status='sunday')
+
+    # Step 2 — Active semester (needed for holiday + calendar checks)
     if not semester_id:
         semester = get_active_semester_for_date(query_date)
         if not semester:
             return {
                 'status': 'no_semester',
+                'day_status': 'normal',
                 'message': 'No active semester found for this date. Please check semester configuration.',
+                'date': query_date,
+                'day': day_of_week,
+                'start_time': start_time,
+                'end_time': end_time,
                 'available_labs': [],
                 'occupied_labs': [],
                 'no_data_labs': [],
+                'calendar_note': None,
             }
         semester_id = semester['id']
 
-    # 3. Check holiday
-    holiday_name = is_holiday(query_date, semester_id)
+    # Step 2 — Holiday (best-effort; skipped if holidays table absent)
+    holiday_name = _is_holiday(query_date, semester_id)
     if holiday_name:
-        all_labs = list_labs()
-        return {
-            'status': 'holiday',
-            'message': f'This date is a holiday: {holiday_name}. All labs are free.',
-            'available_labs': [{'room_number': l['room_number'], 'id': l['id']} for l in all_labs],
-            'occupied_labs': [],
-            'no_data_labs': [],
-        }
+        return _all_free_response(
+            'holiday',
+            f'This date is a holiday: {holiday_name}. All labs are free.',
+            status='holiday',
+            calendar_note=holiday_name,
+        )
 
-    # 4. Check academic calendar — are labs free on this date?
-    calendar_events = get_calendar_events_for_date(query_date, semester_id)
-    free_events = [e for e in calendar_events if e.get('makes_labs_free')]
+    # Step 5 — Per-year academic calendar frees
+    freed_years = _freed_years_for_date(query_date, semester_id)
+    all_years_free = freed_years >= {1, 2, 3, 4}
+    if all_years_free:
+        return _all_free_response(
+            'exam_period',
+            'Labs are free due to academic calendar (exam / pre-commencement period).',
+            status='labs_free',
+            calendar_note='Academic calendar',
+        )
 
-    if free_events:
-        event_names = ', '.join(e['event_name'] for e in free_events)
-        all_labs = list_labs()
-        return {
-            'status': 'labs_free',
-            'message': f'Labs are free due to: {event_names}.',
-            'available_labs': [{'room_number': l['room_number'], 'id': l['id']} for l in all_labs],
-            'occupied_labs': [],
-            'no_data_labs': [],
-            'calendar_events': [e['event_name'] for e in free_events],
-        }
-
-    # 5. Map date to day of week
-    day_names = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY', 'SUNDAY']
-    day_of_week = day_names[parsed_date.weekday()]
-
-    if day_of_week == 'SUNDAY':
-        all_labs = list_labs()
-        return {
-            'status': 'sunday',
-            'message': 'It is a Sunday. All labs are free.',
-            'available_labs': [{'room_number': l['room_number'], 'id': l['id']} for l in all_labs],
-            'occupied_labs': [],
-            'no_data_labs': [],
-        }
-
-    # 6. Fetch occupied sessions that overlap with the requested window
+    # Step 6 — Overlapping lab sessions for this day/time
     resp = requests.get(
         _url('lab_sessions'),
         headers={**_headers(), 'Prefer': 'return=representation'},
@@ -410,15 +569,13 @@ def get_availability(query_date, start_time, end_time, semester_id=None):
     _raise_for_status(resp, 'get_occupied_sessions')
     occupied_sessions = resp.json()
 
-    # 7. Get all labs
-    all_labs = list_labs()
+    all_labs = list_labs_filtered(block=block)
 
-    # Build occupied lab_id set
-    occupied_lab_ids = {s['lab_id'] for s in occupied_sessions}
-
-    # Map lab_id → session details
     lab_sessions_map = {}
     for s in occupied_sessions:
+        ys = _years_for_year_group(s.get('year_group'))
+        if ys & freed_years:
+            continue
         lab_sessions_map.setdefault(s['lab_id'], []).append(s)
 
     available_labs = []
@@ -427,67 +584,94 @@ def get_availability(query_date, start_time, end_time, semester_id=None):
 
     for lab in all_labs:
         lab_id = lab['id']
+        dept = _lab_department_label(lab['room_number'])
+
         if not lab.get('has_data'):
             no_data_labs.append({
                 'room_number': lab['room_number'],
-                'id': lab_id,
-                'message': 'No timetable data uploaded for this lab.',
+                'department': dept,
+                'status': 'no_data',
             })
-        elif lab_id in occupied_lab_ids:
-            sessions_for_lab = lab_sessions_map.get(lab_id, [])
+            continue
+
+        sessions_for_lab = lab_sessions_map.get(lab_id, [])
+        if sessions_for_lab:
+            primary = sessions_for_lab[0]
             occupied_labs.append({
                 'room_number': lab['room_number'],
-                'id': lab_id,
+                'department': dept,
+                'status': 'occupied',
+                'occupied_by': primary.get('class_name', ''),
+                'start_time': primary.get('start_time'),
+                'end_time': primary.get('end_time'),
                 'sessions': sessions_for_lab,
             })
         else:
             available_labs.append({
                 'room_number': lab['room_number'],
-                'id': lab_id,
+                'department': dept,
+                'status': 'available',
             })
 
-    # 8. If there are labs with no data, notify admin (deduplicated)
     for lab in no_data_labs:
         _notify_missing_data(lab['room_number'])
 
+    day_status = 'normal'
+    message = None
+    calendar_note = None
+    if freed_years:
+        banner_status, banner_msg = _calendar_banner_info(query_date, semester_id)
+        if banner_status:
+            day_status = banner_status
+            message = banner_msg
+            calendar_note = banner_msg
+
     return {
         'status': 'ok',
+        'day_status': day_status,
+        'message': message,
         'date': query_date,
-        'day_of_week': day_of_week,
+        'day': day_of_week,
         'start_time': start_time,
         'end_time': end_time,
         'available_labs': available_labs,
         'occupied_labs': occupied_labs,
         'no_data_labs': no_data_labs,
-        'calendar_events': [e['event_name'] for e in calendar_events],
+        'calendar_note': calendar_note,
     }
 
 
 def _notify_missing_data(room_number):
     """Create a missing data notification if one doesn't already exist (unread)."""
-    # Check for existing unread notification for this lab
-    resp = requests.get(
-        _url('notifications'),
-        headers=_headers(),
-        params={
-            'type': 'eq.missing_data',
-            'related_lab': f'eq.{room_number}',
-            'is_read': 'eq.false',
-            'limit': 1,
-        },
-    )
-    if resp.ok and resp.json():
-        return  # Already notified
+    # Best-effort: if schema is missing (e.g., related_lab column not added yet),
+    # do not break availability responses.
+    try:
+        # Check for existing unread notification for this lab
+        resp = requests.get(
+            _url('notifications'),
+            headers=_headers(),
+            params={
+                'type': 'eq.missing_data',
+                'related_lab': f'eq.{room_number}',
+                'is_read': 'eq.false',
+                'limit': 1,
+            },
+        )
+        if resp.ok and resp.json():
+            return  # Already notified
 
-    requests.post(
-        _url('notifications'),
-        headers=_headers(),
-        json={
-            'message': f'No timetable data found for lab {room_number}. Please upload timetable.',
-            'type': 'missing_data',
-            'related_lab': room_number,
-        },
-    )
+        requests.post(
+            _url('notifications'),
+            headers=_headers(),
+            json={
+                'message': f'No timetable data found for lab {room_number}. Please upload timetable.',
+                'type': 'missing_data',
+                'related_lab': room_number,
+            },
+        )
+    except Exception as e:
+        # Non-critical path; do not break availability responses.
+        print(f'[notifications] missing_data notify skipped for {room_number}: {e}')
 
 
 # ── Notifications ─────────────────────────────────────────────
@@ -512,6 +696,16 @@ def mark_notification_read(notif_id):
     _raise_for_status(resp, 'mark_notification_read')
 
 
+def mark_all_notifications_read():
+    resp = requests.patch(
+        _url('notifications'),
+        headers=_headers(),
+        params={'is_read': 'eq.false'},
+        json={'is_read': True},
+    )
+    _raise_for_status(resp, 'mark_all_notifications_read')
+
+
 def create_notification(message, notif_type, related_lab=None):
     payload = {'message': message, 'type': notif_type}
     if related_lab:
@@ -525,18 +719,22 @@ def create_notification(message, notif_type, related_lab=None):
 def log_upload(semester_id, filename, file_type, content_type,
                parse_status, labs_updated, sessions_added,
                warnings, error_message=None, sessions_deleted=0):
-    payload = {
-        'semester_id': semester_id,
-        'filename': filename,
-        'file_type': file_type,
-        'content_type': content_type,
-        'parse_status': parse_status,
-        'labs_updated': labs_updated,
-        'sessions_added': sessions_added,
-        'sessions_deleted': sessions_deleted,
-        'warnings': warnings,
-    }
-    if error_message:
-        payload['error_message'] = error_message
-    resp = requests.post(_url('upload_history'), headers=_headers(), json=payload)
-    # Non-critical, don't raise
+    # Best-effort logging: `upload_history` might not exist yet in Supabase.
+    try:
+        payload = {
+            'semester_id': semester_id,
+            'filename': filename,
+            'file_type': file_type,
+            'content_type': content_type,
+            'parse_status': parse_status,
+            'labs_updated': labs_updated,
+            'sessions_added': sessions_added,
+            'sessions_deleted': sessions_deleted,
+            'warnings': warnings,
+        }
+        if error_message:
+            payload['error_message'] = error_message
+        requests.post(_url('upload_history'), headers=_headers(), json=payload)
+    except Exception:
+        # Non-critical path; ignore failures (missing table, RLS, network, etc.)
+        return

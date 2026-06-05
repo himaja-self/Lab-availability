@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.env.*
+!.env.example
+
+# Cursor / IDE
+.cursor/
+
+# Node (frontend has its own .gitignore too)
+node_modules/
+.next/
+out/
+
+# OS
+.DS_Store
+Thumbs.db

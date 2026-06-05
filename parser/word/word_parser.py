@@ -1,689 +1,426 @@
 """
-Word Document Timetable Parser
-Handles two formats:
-  1. Lab-wise: table has Room No. + I-YEAR / II & III YEAR rows
-  2. Class-wise: table has Time/Day header + course table below (like III year docx)
+Word Document Timetable Parser — VNRVJIET Lab Occupancy System
+
+Handles class-wise Word documents. Each document contains N sections,
+each with 3 tables: timetable grid, course table, OE table.
+Extracts lab sessions only (cells containing 'LAB').
+
+Alignment with excel_parser.py:
+- year_group values: I_YEAR | II_YEAR | III_YEAR | IV_YEAR  (no II_III_YEAR anywhere)
+- year_group source: paragraph text 'Class : III Year' -> III_YEAR (not cell content)
+- class_name: 'BRANCH-SECTION' e.g. 'CSE-DS-A' (from section header)
+- subject: lab short name e.g. 'BDC LAB', 'WT LAB' (always different from class_name)
+- session_type: always 'LAB' for word parser (only lab sessions extracted)
 """
 
 import re
 from docx import Document
-from dateutil import parser as date_parser
+from docx.oxml.ns import qn
 
 # ── Constants ────────────────────────────────────────────────
 
 DAY_MAP = {
-    'MON': 'MONDAY', 'TUE': 'TUESDAY', 'WED': 'WEDNESDAY',
-    'THU': 'THURSDAY', 'FRI': 'FRIDAY', 'SAT': 'SATURDAY',
     'MONDAY': 'MONDAY', 'TUESDAY': 'TUESDAY', 'WEDNESDAY': 'WEDNESDAY',
     'THURSDAY': 'THURSDAY', 'FRIDAY': 'FRIDAY', 'SATURDAY': 'SATURDAY',
 }
 
-DAY_ABBREV = {
+DAY_ABBR_MAP = {
     'MON': 'MONDAY', 'TUE': 'TUESDAY', 'WED': 'WEDNESDAY',
     'THU': 'THURSDAY', 'FRI': 'FRIDAY', 'SAT': 'SATURDAY',
 }
 
-# Slot times for class-wise Word docs (II & III year, 6 slots)
-# Slots 0-2 = morning, slots 3-5 = afternoon
-II_III_YEAR_SLOTS = [
-    ('10:00', '11:00'),
-    ('11:00', '12:00'),
-    ('12:00', '13:00'),
-    ('13:40', '14:40'),
-    ('14:40', '15:40'),
-    ('15:40', '16:40'),
-]
-
-I_YEAR_SLOTS = [
-    ('09:00', '10:00'),
-    ('10:00', '11:00'),
-    ('11:00', '12:00'),
-    ('12:40', '13:40'),
-    ('13:40', '14:40'),
-    ('14:40', '15:40'),
-]
+# Maps Roman numeral from 'Class : III Year' paragraph to DB year_group value.
+# Matches excel_parser convention: I_YEAR | II_YEAR | III_YEAR | IV_YEAR
+ROMAN_TO_YEAR_GROUP = {
+    'I': 'I_YEAR',
+    'II': 'II_YEAR',
+    'III': 'III_YEAR',
+    'IV': 'IV_YEAR',
+}
 
 
-# ── Utility Functions ────────────────────────────────────────
+# ── Utilities ────────────────────────────────────────────────
 
-def clean(val):
-    if val is None:
-        return None
-    s = str(val).strip().replace('\n', ' ').replace('\r', '')
-    return s if s else None
-
-
-def clean_multiline(val):
-    """Keep newlines for parsing room annotations."""
-    if val is None:
-        return None
-    s = str(val).strip()
-    return s if s else None
+def cell_text(cell):
+    return cell.text.strip()
 
 
 def normalize_room(room):
+    """Remove spaces and uppercase: 'E- 402' -> 'E-402', 'D 506' -> 'D-506'."""
     if not room:
         return None
-    # Remove spaces around hyphen, uppercase
-    room = re.sub(r'\s+', '', room.upper())
-    # Ensure format like E-402
-    return room
+    r = re.sub(r'\s+', '', room.upper())
+    r = re.sub(r'^([A-Z])(\d)', r'\1-\2', r)
+    return r
 
 
-def classify_session(text):
-    t = text.upper()
-    if 'TRAINING' in t:
-        return 'TRAINING'
-    if 'MINOR' in t:
-        return 'MINOR'
-    if 'WORKSHOP' in t:
-        return 'WORKSHOP'
-    if 'LAB' in t:
-        return 'LAB'
-    return 'OTHER'
+def is_lunch_cell(text):
+    """Detect the LUNCH column — vertical text like 'L U N C H'."""
+    cleaned = re.sub(r'\s+', '', text).upper()
+    return 'LUNCH' in cleaned
 
 
-def get_cell_text(cell):
-    """Extract full text from a table cell including all paragraphs."""
-    return '\n'.join(p.text.strip() for p in cell.paragraphs if p.text.strip())
+def parse_time(raw):
+    raw = raw.strip().replace('.', ':')
+    m = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', raw, re.IGNORECASE)
+    if not m:
+        return None
+    hour, minute, period = int(m.group(1)), int(m.group(2)), m.group(3).upper()
+    if period == 'PM' and hour != 12:
+        hour += 12
+    if period == 'AM' and hour == 12:
+        hour = 0
+    return '%02d:%02d' % (hour, minute)
 
 
-def extract_year_from_doc(doc):
+# ── Room Field Parser ────────────────────────────────────────
+
+def parse_room_field(room_str):
     """
-    Extract year of study from document paragraphs.
-    Looks for 'I Year', 'II Year', 'III Year', 'IV Year'
+    Handles all room field formats from course tables:
+      'E-501'              -> [('ALL', 'E-501')]
+      'E-501 E-503(Thu)'   -> [('ALL', 'E-501'), ('THURSDAY', 'E-503')]
+      'E-503(Tue) E-403(Thu)' -> [('TUESDAY','E-503'), ('THURSDAY','E-403')]
+      'D 506 & 510'        -> [('ALL','D-506'), ('ALL','D-510')]
+      'B-403 / 405'        -> [('ALL','B-403'), ('ALL','B-405')]
     """
-    for para in doc.paragraphs:
-        text = para.text.upper()
-        if 'IV YEAR' in text or '4TH YEAR' in text:
-            return 4
-        if 'III YEAR' in text or '3RD YEAR' in text:
-            return 3
-        if 'II YEAR' in text or '2ND YEAR' in text:
-            return 2
-        if 'I YEAR' in text or '1ST YEAR' in text:
-            return 1
-    return None
+    if not room_str:
+        return []
 
+    results = []
+    text = room_str.upper().strip()
+    primary_pattern = re.compile(r'([A-Z])\s*-?\s*(\d{3})\s*(?:\(([A-Za-z]{3})\))?')
+    last_block_letter = None
+    pos = 0
 
-# ── Room Annotation Parser ───────────────────────────────────
-
-def parse_room_field(room_text):
-    """
-    Parse room field from course table.
-    Handles:
-      'E-402'                         → {None: 'E-402'}  (all days)
-      'E-501\nE-503(Thu)'             → {'TUESDAY': 'E-501', 'THURSDAY': 'E-503'}
-      'E-502(Fri)\nE-315(Wed)'        → {'FRIDAY': 'E-502', 'WEDNESDAY': 'E-315'}
-      'E-503(Tue)\nE-403(Thu)'        → {'TUESDAY': 'E-503', 'THURSDAY': 'E-403'}
-
-    Returns dict: {day_or_None: room_number}
-    None key means "used on all days this lab appears"
-    """
-    if not room_text:
-        return {}
-
-    result = {}
-    lines = room_text.strip().split('\n')
-
-    for line in lines:
-        line = line.strip()
-        if not line:
+    while pos < len(text):
+        m = primary_pattern.match(text, pos)
+        if m:
+            block, number, day_abbr = m.group(1), m.group(2), m.group(3)
+            room = normalize_room('%s-%s' % (block, number))
+            last_block_letter = block
+            if day_abbr:
+                full_day = DAY_ABBR_MAP.get(day_abbr[:3])
+                results.append((full_day or 'ALL', room))
+            else:
+                results.append(('ALL', room))
+            pos = m.end()
             continue
 
-        # Check for day annotation: E-402(Thu) or E-402(Thursday)
-        match = re.match(r'([A-Z]-?\d{3})\s*\((\w+)\)', line, re.IGNORECASE)
-        if match:
-            room = normalize_room(match.group(1))
-            day_raw = match.group(2).upper()[:3]
-            day = DAY_ABBREV.get(day_raw)
-            if room and day:
-                result[day] = room
-        else:
-            # No day annotation → default room
-            room = normalize_room(re.sub(r'\(.*?\)', '', line).strip())
-            if room and re.match(r'^[A-Z]-?\d{3}$', room):
-                result[None] = room  # None = default (all days)
+        shared_m = re.match(r'\s*[&/]\s*(\d{3})', text[pos:])
+        if shared_m and last_block_letter:
+            room = normalize_room('%s-%s' % (last_block_letter, shared_m.group(1)))
+            results.append(('ALL', room))
+            pos += shared_m.end()
+            continue
 
+        pos += 1
+
+    return results
+
+
+def build_room_map(room_str):
+    room_map = {}
+    for day_key, room in parse_room_field(room_str):
+        room_map.setdefault(day_key, []).append(room)
+    return room_map
+
+
+def get_rooms_for_day(room_map, day):
+    return room_map.get(day) or room_map.get('ALL') or []
+
+
+# ── Table Classification ─────────────────────────────────────
+
+def get_unique_cells(row):
+    seen = set()
+    result = []
+    for cell in row.cells:
+        if id(cell) not in seen:
+            seen.add(id(cell))
+            result.append(cell)
     return result
-
-
-def resolve_room_for_day(room_map, day):
-    """
-    Given a room_map from parse_room_field and a day,
-    return the correct room number.
-    """
-    if day in room_map:
-        return room_map[day]
-    if None in room_map:
-        return room_map[None]
-    return None
-
-
-# ── Class-Wise Word Parser ───────────────────────────────────
-
-def is_timetable_table(table):
-    """
-    Detect if a table is a class timetable grid.
-    Looks for day names in first column and slot numbers/times in first row.
-    """
-    if not table.rows:
-        return False
-
-    # Check first row for time/slot indicators
-    first_row_text = ' '.join(
-        get_cell_text(cell).upper() for cell in table.rows[0].cells
-    )
-    has_slots = bool(re.search(r'\b(I|II|III|IV|V|VI)\b|10:00|11:00|09:00', first_row_text))
-
-    # Check first column for day names
-    day_count = 0
-    for row in table.rows[1:]:
-        cell_text = get_cell_text(row.cells[0]).upper()[:3]
-        if cell_text in DAY_ABBREV:
-            day_count += 1
-
-    return has_slots and day_count >= 3
 
 
 def is_course_table(table):
-    """
-    Detect if a table is a course/subject table.
-    Looks for 'Course Code', 'Subject', 'Room', 'Lab' columns.
-    """
     if not table.rows:
         return False
-    first_row_text = ' '.join(
-        get_cell_text(cell).upper() for cell in table.rows[0].cells
-    )
-    indicators = ['COURSE', 'SUBJECT', 'CODE', 'ROOM', 'FACULTY', 'LAB']
-    return sum(1 for ind in indicators if ind in first_row_text) >= 2
+    headers = ' '.join(cell_text(c) for c in get_unique_cells(table.rows[0])).upper()
+    return 'COURSE CODE' in headers and 'ROOM' in headers
 
 
-def parse_course_table(table):
-    """
-    Parse course table to build subject→room mapping.
-    Returns dict: {subject_keyword: {day_or_None: room}}
-
-    subject_keyword is normalized (uppercase, stripped)
-    """
-    course_map = {}
-
+def is_timetable(table):
     if not table.rows:
-        return course_map
-
-    # Find column indices for subject name and room
-    header_row = table.rows[0]
-    header_texts = [get_cell_text(cell).upper() for cell in header_row.cells]
-
-    subject_col = None
-    room_col = None
-
-    for i, h in enumerate(header_texts):
-        if 'COURSE' in h or 'SUBJECT' in h or 'NAME' in h:
-            if subject_col is None:
-                subject_col = i
-        if 'ROOM' in h or 'LAB ROOM' in h or 'VENUE' in h:
-            room_col = i
-
-    # Fallback: if headers not found, try common positions
-    if subject_col is None:
-        subject_col = 1  # usually second column
-    if room_col is None:
-        # Look for column with room-like values
-        for i, h in enumerate(header_texts):
-            if re.search(r'[A-Z]-\d{3}', h):
-                room_col = i
-                break
-        if room_col is None:
-            room_col = 3  # usually fourth column
-
-    for row in table.rows[1:]:
-        if len(row.cells) <= max(subject_col, room_col):
-            continue
-
-        subject_text = clean(get_cell_text(row.cells[subject_col]))
-        room_text = clean_multiline(get_cell_text(row.cells[room_col]))
-
-        if not subject_text or not room_text:
-            continue
-
-        # Only care about lab subjects
-        if 'LAB' not in subject_text.upper():
-            continue
-
-        # Normalize subject to a keyword for matching
-        # e.g. "Big Data Computing Lab (BDC Lab)" → "BDC LAB"
-        # Extract abbreviation in parentheses if present
-        abbrev_match = re.search(r'\(([^)]+)\)', subject_text)
-        if abbrev_match:
-            keyword = abbrev_match.group(1).upper().strip()
-        else:
-            keyword = subject_text.upper().strip()
-
-        room_map = parse_room_field(room_text)
-        if room_map:
-            course_map[keyword] = room_map
-
-            # Also add the full subject name as a key
-            full_key = subject_text.upper().strip()
-            if full_key != keyword:
-                course_map[full_key] = room_map
-
-    return course_map
+        return False
+    header_text = ' '.join(cell_text(c) for c in get_unique_cells(table.rows[0])).upper()
+    has_time = bool(re.search(r'\d{1,2}[\.:]\d{2}\s*(AM|PM)', header_text, re.IGNORECASE))
+    has_day_col = 'TIME' in header_text or 'DAY' in header_text
+    return has_time and has_day_col
 
 
-def find_lab_in_course_map(cell_text, course_map):
+# ── Section Metadata Extraction ──────────────────────────────
+
+def extract_section_meta(paragraphs):
     """
-    Given a timetable cell text like 'BDC LAB' or 'WT LAB',
-    find matching entry in course_map.
-    Returns list of (keyword, room_map) tuples (could be multiple for split batches).
+    Reads class metadata from the paragraph block before each timetable table.
+    Extracts branch, section letter, and year -> year_group.
+    year_group uses same values as excel_parser: I_YEAR | II_YEAR | III_YEAR | IV_YEAR.
     """
-    matches = []
-    cell_upper = cell_text.upper()
+    combined = ' '.join(paragraphs)
 
-    # Handle split batches: 'BDC LAB/WT LAB' or 'BDC LAB / WT LAB'
-    parts = re.split(r'[/\n]', cell_upper)
-
-    for part in parts:
-        part = part.strip()
-        if 'LAB' not in part:
-            continue
-
-        for keyword, room_map in course_map.items():
-            # Check if keyword appears in this part
-            kw_clean = re.sub(r'\s+', ' ', keyword).strip()
-            part_clean = re.sub(r'\s+', ' ', part).strip()
-
-            if kw_clean in part_clean or part_clean in kw_clean:
-                matches.append((keyword, room_map))
-                break
-
-    return matches
-
-
-def detect_slot_times(timetable_table, year_group='II_III_YEAR'):
-    """
-    Try to extract actual slot times from the timetable header row.
-    Falls back to default time bands if parsing fails.
-    """
-    band = I_YEAR_SLOTS if year_group == 'I_YEAR' else II_III_YEAR_SLOTS
-
-    if not timetable_table.rows:
-        return band
-
-    # Look for time patterns in first 2 rows
-    time_pattern = re.compile(r'(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})')
-    extracted = []
-
-    for row in timetable_table.rows[:2]:
-        for cell in row.cells:
-            text = get_cell_text(cell)
-            for match in time_pattern.finditer(text):
-                extracted.append((match.group(1), match.group(2)))
-
-    if len(extracted) >= 6:
-        return extracted[:6]
-
-    return band
-
-
-def parse_class_wise_word(doc, source_file):
-    """
-    Parse class-wise Word document.
-    Groups tables as: [timetable_table, course_table, elective_table] per section.
-    Returns list of session dicts.
-    """
-    sessions = []
-    warnings = []
-
-    tables = doc.tables
-    year_of_study = extract_year_from_doc(doc)
-
-    # Determine year group for time slots
-    if year_of_study == 1:
-        year_group = 'I_YEAR'
-        slot_band = I_YEAR_SLOTS
-    else:
-        year_group = 'II_III_YEAR'
-        slot_band = II_III_YEAR_SLOTS
-
-    # Extract section name from paragraphs between tables
-    # We'll collect all paragraphs and table in document order
-    # by iterating doc body elements
-
-    # Group tables: every timetable table is followed by a course table
-    timetable_tables = []
-    course_tables = []
-
-    for table in tables:
-        if is_timetable_table(table):
-            timetable_tables.append(table)
-        elif is_course_table(table):
-            course_tables.append(table)
-
-    # Pair each timetable with its corresponding course table
-    # They appear in order: TT1, Course1, TT2, Course2 ...
-    pairs = []
-    tt_idx = 0
-    ct_idx = 0
-
-    # Walk through all tables in order to pair them
-    tt_set = set(id(t) for t in timetable_tables)
-    ct_set = set(id(t) for t in course_tables)
-
-    current_tt = None
-    for table in tables:
-        if id(table) in tt_set:
-            current_tt = table
-        elif id(table) in ct_set and current_tt is not None:
-            pairs.append((current_tt, table))
-            current_tt = None
-
-    if not pairs:
-        warnings.append("Could not pair timetable tables with course tables.")
-        return sessions, warnings
-
-    # Parse each section
-    for tt_table, course_table in pairs:
-        # Build course→room map from course table
-        course_map = parse_course_table(course_table)
-
-        if not course_map:
-            warnings.append("Course table found but no lab rooms extracted.")
-            continue
-
-        # Extract section name from timetable table (usually in header area)
-        section_name = None
-        if tt_table.rows:
-            header_text = get_cell_text(tt_table.rows[0].cells[0])
-            if re.search(r'\b(DS|CYS|AI|CSE|ECE|EEE|MECH|CIVIL)\b', header_text, re.IGNORECASE):
-                section_name = clean(header_text)
-
-        # Get slot times from timetable (or use defaults)
-        slot_times = detect_slot_times(tt_table, year_group)
-
-        # Parse each day row in the timetable
-        for row in tt_table.rows[1:]:  # skip header row
-            if not row.cells:
-                continue
-
-            day_cell = get_cell_text(row.cells[0]).upper().strip()
-            day_key = day_cell[:3]
-            day_name = DAY_MAP.get(day_key) or DAY_MAP.get(day_cell)
-
-            if not day_name:
-                continue
-
-            # Examine each slot cell (columns 1 onwards, skip day column)
-            # Track which column indices we've processed
-            processed_cols = set()
-            cells = row.cells
-
-            slot_idx = 0  # 0-based slot index
-            for col_idx in range(1, len(cells)):
-                if col_idx in processed_cols:
-                    slot_idx += 1
-                    continue
-
-                cell_text = get_cell_text(cells[col_idx]).strip()
-
-                if not cell_text:
-                    slot_idx += 1
-                    continue
-
-                cell_upper = cell_text.upper()
-
-                # Skip lunch
-                if 'LUNCH' in cell_upper or cell_upper == 'L':
-                    continue
-
-                # Check if this is a lab session
-                if 'LAB' not in cell_upper:
-                    slot_idx += 1
-                    continue
-
-                # Detect merged span (3 consecutive identical cells = 3-hour lab)
-                merge_end = col_idx
-                for next_col in range(col_idx + 1, min(col_idx + 3, len(cells))):
-                    next_text = get_cell_text(cells[next_col]).strip().upper()
-                    if next_text == cell_upper or not next_text:
-                        merge_end = next_col
-                        processed_cols.add(next_col)
-                    else:
-                        break
-
-                # Determine start and end slot indices for this block
-                start_slot = slot_idx
-                end_slot = start_slot + (merge_end - col_idx)
-
-                # Get time range
-                if start_slot < len(slot_times):
-                    start_time = slot_times[start_slot][0]
-                else:
-                    start_time = slot_times[-1][0]
-
-                if end_slot < len(slot_times):
-                    end_time = slot_times[end_slot][1]
-                else:
-                    end_time = slot_times[-1][1]
-
-                # Find lab(s) from course map
-                lab_matches = find_lab_in_course_map(cell_text, course_map)
-
-                if not lab_matches:
-                    warnings.append(
-                        f"Could not find room for '{cell_text}' on {day_name}. "
-                        "Check course table."
-                    )
-                    slot_idx += 1
-                    continue
-
-                for keyword, room_map in lab_matches:
-                    room = resolve_room_for_day(room_map, day_name[:3])
-
-                    if not room:
-                        warnings.append(
-                            f"No room found for '{keyword}' on {day_name}."
-                        )
-                        continue
-
-                    sessions.append({
-                        'room_number': room,
-                        'day_of_week': day_name,
-                        'start_time': start_time,
-                        'end_time': end_time,
-                        'class_name': section_name or '',
-                        'subject': keyword,
-                        'session_type': classify_session(keyword),
-                        'year_group': year_group,
-                        'source_file': source_file,
-                    })
-
-                slot_idx += 1
-
-    return sessions, warnings
-
-
-# ── Lab-Wise Word Parser ─────────────────────────────────────
-
-def is_lab_wise_table(table):
-    """
-    Detect if a table is a lab-wise timetable.
-    Looks for 'Room No.' or 'I-YEAR' / 'II & III YEAR' in the table.
-    """
-    full_text = ''
-    for row in table.rows[:5]:
-        for cell in row.cells:
-            full_text += get_cell_text(cell).upper() + ' '
-
-    return (
-        'ROOM NO' in full_text or
-        'I-YEAR' in full_text or
-        'I YEAR' in full_text or
-        ('II' in full_text and 'III YEAR' in full_text)
+    branch_m = re.search(
+        r'Branch\s*[:\-]\s*([A-Za-z0-9&\-\(\), ]+?)(?=Programme|Regulation|Section|Class|$)',
+        combined
     )
+    section_m = re.search(r'Section\s*[:\-]\s*([A-Z])', combined)
+    year_m = re.search(r'Class\s*[:\-]\s*(I{1,3}V?|IV)\s*Year', combined, re.IGNORECASE)
 
+    branch = branch_m.group(1).strip() if branch_m else 'UNKNOWN'
+    section = section_m.group(1) if section_m else '?'
+    roman = year_m.group(1).upper() if year_m else 'III'
+    year_group = ROMAN_TO_YEAR_GROUP.get(roman, 'II_YEAR')
 
-def parse_lab_wise_word(doc, source_file):
-    """
-    Parse lab-wise Word timetable.
-    Structure similar to Excel lab-wise sheets.
-    """
-    sessions = []
-    warnings = []
-
-    for table in doc.tables:
-        if not is_lab_wise_table(table):
-            continue
-
-        # Extract room number from table metadata
-        room_number = None
-        for row in table.rows[:5]:
-            for cell in row.cells:
-                text = get_cell_text(cell)
-                room_match = re.search(r'\b([A-Z]-?\s*\d{3})\b', text)
-                if room_match:
-                    room_number = normalize_room(room_match.group(1))
-                    break
-            if room_number:
-                break
-
-        if not room_number:
-            warnings.append("Lab-wise Word table found but could not extract room number.")
-            continue
-
-        # Find header row with slot labels
-        header_row_idx = None
-        slot_cols = {}
-
-        for row_idx, row in enumerate(table.rows):
-            row_texts = [get_cell_text(c).upper().strip() for c in row.cells]
-            if 'I' in row_texts and 'II' in row_texts:
-                header_row_idx = row_idx
-                for col_idx, text in enumerate(row_texts):
-                    if text in ('I', 'II', 'III', 'IV', 'V', 'VI'):
-                        slot_cols[text] = col_idx
-                break
-
-        if header_row_idx is None:
-            warnings.append(f"Could not find slot header row in lab-wise table for {room_number}.")
-            continue
-
-        # Detect time bands (rows after header)
-        # Find I-YEAR and II&III-YEAR rows
-        year_time_map = {}
-        for row in table.rows[header_row_idx + 1: header_row_idx + 4]:
-            row_texts = [get_cell_text(c) for c in row.cells]
-            first_cell = row_texts[0].upper() if row_texts else ''
-
-            times_in_row = []
-            for text in row_texts:
-                time_matches = re.findall(r'\d{1,2}:\d{2}', text)
-                times_in_row.extend(time_matches)
-
-            if 'I' in first_cell and 'YEAR' in first_cell and times_in_row:
-                year_time_map['I_YEAR'] = times_in_row
-            elif 'II' in first_cell and times_in_row:
-                year_time_map['II_III_YEAR'] = times_in_row
-
-        # Sort slot labels
-        slot_order = sorted(slot_cols.items(), key=lambda x: x[1])  # (label, col_idx)
-
-        # Parse day rows
-        for row in table.rows[header_row_idx + 1:]:
-            row_texts = [get_cell_text(c) for c in row.cells]
-            if not row_texts:
-                continue
-
-            day_key = row_texts[0].upper().strip()[:3]
-            day_name = DAY_MAP.get(day_key)
-            if not day_name:
-                continue
-
-            processed = set()
-            for label, col_idx in slot_order:
-                if col_idx in processed or col_idx >= len(row_texts):
-                    continue
-
-                cell_text = clean(row_texts[col_idx])
-                if not cell_text:
-                    continue
-
-                # Detect merge span by checking adjacent identical cells
-                merge_slots = [label]
-                for next_label, next_col in slot_order:
-                    if next_col <= col_idx:
-                        continue
-                    next_text = clean(row_texts[next_col]) if next_col < len(row_texts) else None
-                    if next_text == cell_text or not next_text:
-                        merge_slots.append(next_label)
-                        processed.add(next_col)
-                    else:
-                        break
-
-                year_group = 'I_YEAR' if re.match(r'^I[\s\-]', cell_text, re.IGNORECASE) else 'II_III_YEAR'
-                band = I_YEAR_SLOTS if year_group == 'I_YEAR' else II_III_YEAR_SLOTS
-
-                slot_label_to_idx = {lbl: idx for idx, (lbl, _) in enumerate(slot_order)}
-                slot_indices = [slot_label_to_idx.get(s, 0) for s in merge_slots]
-
-                start_time = band[slot_indices[0]][0] if slot_indices[0] < len(band) else band[0][0]
-                end_time = band[slot_indices[-1]][1] if slot_indices[-1] < len(band) else band[-1][1]
-
-                sessions.append({
-                    'room_number': room_number,
-                    'day_of_week': day_name,
-                    'start_time': start_time,
-                    'end_time': end_time,
-                    'class_name': cell_text,
-                    'subject': cell_text,
-                    'session_type': classify_session(cell_text),
-                    'year_group': year_group,
-                    'source_file': source_file,
-                })
-
-    return sessions, warnings
-
-
-# ── Main Word Parse Entry Point ──────────────────────────────
-
-def parse_word(filepath, source_file):
-    """
-    Main entry point for Word document parsing.
-    Auto-detects lab-wise vs class-wise content.
-    """
-    doc = Document(filepath)
-
-    result = {
-        'sessions': [],
-        'labs_found': [],
-        'warnings': [],
-        'content_types_found': [],
+    return {
+        'branch': branch,
+        'section': section,
+        'year_group': year_group,
+        'class_name': '%s-%s' % (branch, section),
     }
 
-    # Check for lab-wise tables first
-    lab_wise_tables = [t for t in doc.tables if is_lab_wise_table(t)]
-    if lab_wise_tables:
-        sessions, warnings = parse_lab_wise_word(doc, source_file)
-        result['sessions'].extend(sessions)
-        result['warnings'].extend(warnings)
-        result['content_types_found'].append('lab_wise')
 
-    # Check for class-wise tables
-    tt_tables = [t for t in doc.tables if is_timetable_table(t)]
-    if tt_tables:
-        sessions, warnings = parse_class_wise_word(doc, source_file)
-        result['sessions'].extend(sessions)
-        result['warnings'].extend(warnings)
-        result['content_types_found'].append('class_wise')
+# ── Course Table → Lab Lookup ────────────────────────────────
 
-    if not result['content_types_found']:
-        result['warnings'].append(
-            "Could not detect timetable format in this Word document. "
-            "Manual review required."
+def build_lab_lookup(course_table):
+    """
+    Builds {short_name -> room_map} from the course table.
+    Only rows containing LAB or Laboratory are included.
+    Handles both '(WT Lab)' style short names and '(AECS)' acronym style.
+    """
+    lookup = {}
+
+    for row in course_table.rows[1:]:
+        cells = get_unique_cells(row)
+        if len(cells) < 3:
+            continue
+
+        name_col = cell_text(cells[1])
+        room_col = cell_text(cells[2])
+
+        if 'LAB' not in name_col.upper() and 'LABORATOR' not in name_col.upper():
+            continue
+
+        room_map = build_room_map(room_col)
+        if not room_map:
+            continue
+
+        # Prefer the parenthesised short name e.g. '(WT Lab)' or '(BDC Lab)'
+        short_m = re.search(r'\(([^)]+(?:Lab|Laboratory)[^)]*)\)', name_col, re.IGNORECASE)
+        if short_m:
+            short_name = re.sub(r'\s+', ' ', short_m.group(1).strip().upper())
+            lookup[short_name] = room_map
+        else:
+            # Fall back to acronym e.g. '(AECS)' -> adds 'AECS' and 'AECS LAB'
+            acronym_m = re.search(r'\(([A-Z]{2,})\)', name_col)
+            if acronym_m:
+                acronym = acronym_m.group(1)
+                lookup[acronym] = room_map
+                lookup[acronym + ' LAB'] = room_map
+
+    return lookup
+
+
+def resolve_lab_cell(cell_text_val, lab_lookup, day):
+    """
+    Given a timetable cell like 'BDC LAB / WT LAB', returns a list of
+    (lab_name, room_number) pairs — one per lab in split-batch slots.
+    """
+    if 'LAB' not in cell_text_val.upper():
+        return []
+
+    results = []
+    parts = [p.strip() for p in re.split(r'/', cell_text_val)]
+
+    for part in parts:
+        part_upper = part.upper().strip()
+        room_map = lab_lookup.get(part_upper)
+
+        if room_map is None:
+            for key, rmap in lab_lookup.items():
+                if part_upper in key or key in part_upper:
+                    room_map = rmap
+                    break
+
+        if room_map is None:
+            continue
+
+        rooms = get_rooms_for_day(room_map, day)
+        for room in rooms:
+            if room:
+                results.append((part_upper, normalize_room(room)))
+
+    return results
+
+
+# ── Slot Time Parser ─────────────────────────────────────────
+
+def parse_slot_times(header_row):
+    """Reads actual clock times from timetable header row by column index."""
+    slot_times = {}
+    for i, cell in enumerate(header_row.cells):
+        text = cell_text(cell)
+        times = re.findall(r'\d{1,2}[\.:]\d{2}\s*(?:AM|PM)', text, re.IGNORECASE)
+        if len(times) >= 2:
+            start = parse_time(times[0])
+            end = parse_time(times[1])
+            if start and end:
+                slot_times[i] = (start, end)
+    return slot_times
+
+
+# ── Session Extractor ────────────────────────────────────────
+
+def _extract_lab_sessions(tt_table, course_table, meta,
+                           sessions, labs_found, warnings, source_file):
+    lab_lookup = build_lab_lookup(course_table)
+    if not lab_lookup:
+        warnings.append('No lab entries found in course table for %s' % meta.get('class_name'))
+        return
+
+    slot_times = parse_slot_times(tt_table.rows[0])
+    if not slot_times:
+        warnings.append('Could not parse slot times for %s' % meta.get('class_name'))
+        return
+
+    for row in tt_table.rows[1:]:
+        raw_cells = row.cells
+        if not raw_cells:
+            continue
+
+        day_raw = cell_text(raw_cells[0]).upper().strip()
+        day = DAY_MAP.get(day_raw) or DAY_ABBR_MAP.get(day_raw[:3])
+        if not day:
+            continue
+
+        seen_ids = set()
+
+        for col_idx, cell in enumerate(raw_cells):
+            if col_idx == 0:
+                continue
+
+            cid = id(cell)
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+
+            text = cell_text(cell)
+            if not text or is_lunch_cell(text):
+                continue
+
+            span_cols = [j for j, c in enumerate(raw_cells) if id(c) == cid]
+            covered = [slot_times[c] for c in span_cols if c in slot_times]
+            if not covered:
+                continue
+
+            start_time = min(t[0] for t in covered)
+            end_time = max(t[1] for t in covered)
+
+            lab_rooms = resolve_lab_cell(text, lab_lookup, day)
+            if not lab_rooms:
+                continue
+
+            for lab_name, room in lab_rooms:
+                labs_found.add(room)
+                sessions.append({
+                    'room_number':  room,
+                    'day_of_week':  day,
+                    'start_time':   start_time,
+                    'end_time':     end_time,
+                    'class_name':   meta.get('class_name', ''),
+                    'subject':      lab_name,
+                    'session_type': 'LAB',
+                    # year_group from paragraph metadata, not cell text.
+                    # Uses same values as excel_parser: I_YEAR|II_YEAR|III_YEAR|IV_YEAR
+                    'year_group':   meta.get('year_group', 'II_YEAR'),
+                    'source_file':  source_file,
+                })
+
+
+def _get_table_for_element(doc, xml_element):
+    for table in doc.tables:
+        if table._element is xml_element:
+            return table
+    return None
+
+
+# ── Main Entry Point ─────────────────────────────────────────
+
+def parse_word(filepath, source_file):
+    doc = Document(filepath)
+
+    sessions = []
+    warnings = []
+    labs_found = set()
+
+    para_buffer = []
+    pending_tt = None
+
+    for block in doc.element.body:
+        tag = block.tag.split('}')[-1]
+
+        if tag == 'p':
+            texts = [n.text or '' for n in block.iter() if n.tag == qn('w:t')]
+            text = ''.join(texts).strip()
+            if text:
+                para_buffer.append(text)
+
+        elif tag == 'tbl':
+            table = _get_table_for_element(doc, block)
+            if table is None:
+                continue
+
+            if is_course_table(table):
+                if pending_tt is not None:
+                    tt_table, tt_meta = pending_tt
+                    _extract_lab_sessions(
+                        tt_table, table, tt_meta,
+                        sessions, labs_found, warnings, source_file
+                    )
+                    pending_tt = None
+                para_buffer = []
+
+            elif is_timetable(table):
+                meta = extract_section_meta(para_buffer)
+                pending_tt = (table, meta)
+                para_buffer = []
+
+            else:
+                para_buffer = []
+
+    if pending_tt is not None:
+        warnings.append(
+            'Timetable for %s found no following course table — sessions not extracted.'
+            % pending_tt[1].get('class_name', 'unknown')
         )
 
-    result['labs_found'] = list({s['room_number'] for s in result['sessions']})
+    return {
+        'sessions':   sessions,
+        'labs_found': sorted(labs_found),
+        'warnings':   warnings,
+    }
 
-    return result
+
+if __name__ == '__main__':
+    import sys
+    path = sys.argv[1] if len(sys.argv) > 1 else 'test.docx'
+    result = parse_word(path, path.split('/')[-1])
+    print('Sessions:  %d' % len(result['sessions']))
+    print('Labs found: %s' % result['labs_found'])
+    print('Warnings:  %s' % result['warnings'])
+    print()
+    for s in result['sessions']:
+        print('  %-22s %-10s %s-%s  %-8s %-25s [%s]' % (
+            s['class_name'], s['day_of_week'],
+            s['start_time'], s['end_time'],
+            s['room_number'], s['subject'],
+            s['year_group'],
+        ))

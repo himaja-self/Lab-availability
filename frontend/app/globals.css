@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+:root {
+  --navy: #1c1f4c;
+  --teal: #00848c;
+  --teal-dark: #037272;
+  --yellow: #fccf17;
+  --amber: #fec20f;
+  --cream: #edebd9;
+  --teal-border: rgba(0, 132, 140, 0.2);
+  --green-border: rgba(0, 132, 140, 0.45);
+}
+
+@theme inline {
+  --color-navy: var(--navy);
+  --color-teal: var(--teal);
+  --color-teal-dark: var(--teal-dark);
+  --color-yellow: var(--yellow);
+  --color-amber: var(--amber);
+  --color-cream: var(--cream);
+  --font-sans: var(--font-jakarta);
+}
+
+body {
+  background: var(--cream);
+  color: var(--navy);
+  font-family: var(--font-jakarta), system-ui, sans-serif;
+}
